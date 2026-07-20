@@ -27,7 +27,7 @@
 <script type="text/babel" data-presets="react">
 const { useState, useEffect, useMemo } = React;
 
-/* ⚠️ Pega aquí la URL de tu Apps Script (termina en /exec) */
+/* Pega aquí la URL de tu Apps Script (termina en /exec) */
 const SHEET_API_URL = "https://script.google.com/macros/s/AKfycbxu6kowbIQKyTlIdRO6vhmrG1nSxCSOWfk5cFphsnhy_znF4jFlmhKc4CYi0PWA7SKhEQ/exec";
 
 const COLORS = {
@@ -36,9 +36,12 @@ const COLORS = {
 };
 const ETAPAS = ["Reunión","Investigación","Planeación","Diseño","Edición","Correcciones","Reunión final","Administración","Comunicación con cliente","Otro"];
 const ESTADOS = ["Cotizado","Aprobado","En proceso","Entregado","Cancelado"];
+const ESTADOS_CURSO = ["Cotizado","Cerrado - pendiente de pago","Pagado","Cancelado"];
 const MONEDAS = ["USD","CRC"];
 const METODOS = ["PayPal","Zelle","SINPE","Transferencia","Efectivo","Otro"];
+const ORIGENES = ["Instagram","TikTok","Recomendación","Facebook","WhatsApp","Otro"];
 const COMISION_SUGERIDA = { PayPal: 5.4, Zelle: 0, SINPE: 0, Transferencia: 0, Efectivo: 0, Otro: 0 };
+const DIAS_ALERTA_COTIZACION = 7;
 
 const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
 function fmtMoney(n, moneda = "USD") {
@@ -53,8 +56,16 @@ function minutesToHM(mins) {
   if (m === 0) return `${h} h`;
   return `${h} h ${m} min`;
 }
+function diasDesde(fecha) {
+  if (!fecha) return null;
+  const d = new Date(fecha + "T00:00:00");
+  if (isNaN(d)) return null;
+  const hoy = new Date();
+  hoy.setHours(0, 0, 0, 0);
+  return Math.round((hoy - d) / 86400000);
+}
 function totalMinutos(p) { return (p.tiempos || []).reduce((s, t) => s + (Number(t.minutos) || 0), 0); }
-function netoProyecto(p) {
+function netoItem(p) {
   const precio = Number(p.precioFinal ?? p.precioCotizado ?? 0);
   const comision = Number(p.comisionMonto || 0);
   return precio - comision;
@@ -62,35 +73,59 @@ function netoProyecto(p) {
 function valorHora(p) {
   const mins = totalMinutos(p);
   if (!mins) return null;
-  return netoProyecto(p) / (mins / 60);
+  return netoItem(p) / (mins / 60);
 }
+function montoBrutoItem(p) { return Number(p.precioFinal ?? p.precioCotizado ?? 0); }
+
+function bucketProyecto(p) {
+  if (p.estado === "Cancelado") return null;
+  if (p.estado === "Cotizado") return "cotizado";
+  if (!p.fechaPago) return "confirmado";
+  return "pagado";
+}
+function bucketCurso(c) {
+  if (c.estado === "Cancelado") return null;
+  if (c.estado === "Cotizado") return "cotizado";
+  if (c.estado === "Pagado") return "pagado";
+  return "confirmado";
+}
+
 const emptyProject = () => ({
-  id: uid(), fecha: new Date().toISOString().slice(0, 10), cliente: "", pais: "", servicio: "",
+  id: uid(), tipo: "proyecto", fecha: new Date().toISOString().slice(0, 10), cliente: "", pais: "", servicio: "", origen: "",
   estado: "Cotizado", precioCotizado: "", precioFinal: "", moneda: "USD", metodoPago: "PayPal",
   comisionMonto: "", fechaPago: "", pagoCompleto: true, tiempos: [],
 });
+const emptyCurso = () => ({
+  id: uid(), tipo: "curso", fecha: new Date().toISOString().slice(0, 10), curso: "", cliente: "", correo: "", pais: "", origen: "",
+  estado: "Cotizado", precioCotizado: "", precioFinal: "", moneda: "USD", metodoPago: "PayPal",
+  comisionMonto: "", fechaPago: "", pagoCompleto: true, cupoTotal: "",
+});
 
-async function loadProjects() {
+/* ---------- Almacenamiento en Google Sheets ---------- */
+async function loadData() {
   try {
     const res = await fetch(SHEET_API_URL);
     const data = await res.json();
-    return Array.isArray(data) ? data : [];
-  } catch (e) { console.error("No se pudo cargar desde Google Sheets", e); return []; }
+    if (Array.isArray(data)) return { proyectos: data, cursos: [] }; // formato antiguo
+    return { proyectos: data.proyectos || [], cursos: data.cursos || [] };
+  } catch (e) { console.error("No se pudo cargar desde Google Sheets", e); return { proyectos: [], cursos: [] }; }
 }
-async function saveProjects(list) {
+async function saveData(data) {
   try {
     await fetch(SHEET_API_URL, {
       method: "POST",
       headers: { "Content-Type": "text/plain;charset=utf-8" },
-      body: JSON.stringify(list),
+      body: JSON.stringify(data),
     });
   } catch (e) { console.error("No se pudo guardar en Google Sheets", e); }
 }
 
+/* ---------- UI base ---------- */
 function EstadoBadge({ estado }) {
   const map = {
     Cotizado: { bg: "#F2E9DC", fg: "#8A6A2F" }, Aprobado: { bg: "#DCEFEA", fg: "#0FA898" },
     "En proceso": { bg: "#FDE6D9", fg: "#C86A2A" }, Entregado: { bg: "#E4F2E0", fg: "#3D8A34" },
+    "Cerrado - pendiente de pago": { bg: "#FDE6D9", fg: "#C86A2A" }, Pagado: { bg: "#E4F2E0", fg: "#3D8A34" },
     Cancelado: { bg: "#F6DEE1", fg: "#C81F44" },
   };
   const c = map[estado] || { bg: "#eee", fg: "#666" };
@@ -113,6 +148,26 @@ function Field({ label, children }) {
 }
 const inputStyle = { border: `1px solid ${COLORS.line}`, borderRadius: 8, padding: "9px 10px", fontSize: 14, fontFamily: "inherit", color: COLORS.ink, background: "#FCFAF7", outline: "none" };
 
+function BarraSimple({ data, valueKey, labelKey, color, formatValue }) {
+  const max = Math.max(1, ...data.map((d) => d[valueKey]));
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+      {data.map((d, i) => (
+        <div key={i}>
+          <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12, marginBottom: 3 }}>
+            <span style={{ fontWeight: 700 }}>{d[labelKey]}</span>
+            <span style={{ color: COLORS.inkSoft }}>{formatValue ? formatValue(d[valueKey]) : d[valueKey]}</span>
+          </div>
+          <div style={{ background: "#F1EBE2", borderRadius: 6, height: 10, overflow: "hidden" }}>
+            <div style={{ width: `${(d[valueKey] / max) * 100}%`, background: color, height: "100%", borderRadius: 6, transition: "width .3s" }} />
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+/* ---------- Formulario de Proyecto ---------- */
 function ProjectForm({ initial, onCancel, onSave }) {
   const [p, setP] = useState(initial);
   const [nuevaEtapa, setNuevaEtapa] = useState(ETAPAS[0]);
@@ -131,7 +186,7 @@ function ProjectForm({ initial, onCancel, onSave }) {
     setNuevosMin("");
   };
   const quitarTiempo = (id) => set("tiempos", p.tiempos.filter((t) => t.id !== id));
-  const neto = netoProyecto(p), vh = valorHora(p);
+  const neto = netoItem(p), vh = valorHora(p);
 
   return (
     <Card>
@@ -141,6 +196,12 @@ function ProjectForm({ initial, onCancel, onSave }) {
         <Field label="Cliente"><input style={inputStyle} value={p.cliente} onChange={(e) => set("cliente", e.target.value)} placeholder="Nombre" /></Field>
         <Field label="País"><input style={inputStyle} value={p.pais} onChange={(e) => set("pais", e.target.value)} placeholder="Costa Rica" /></Field>
         <Field label="Servicio"><input style={inputStyle} value={p.servicio} onChange={(e) => set("servicio", e.target.value)} placeholder="Asesoría, invitación..." /></Field>
+        <Field label="Origen">
+          <select style={inputStyle} value={p.origen} onChange={(e) => set("origen", e.target.value)}>
+            <option value="">Sin especificar</option>
+            {ORIGENES.map((o) => <option key={o}>{o}</option>)}
+          </select>
+        </Field>
         <Field label="Estado">
           <select style={inputStyle} value={p.estado} onChange={(e) => set("estado", e.target.value)}>{ESTADOS.map((s) => <option key={s}>{s}</option>)}</select>
         </Field>
@@ -196,64 +257,154 @@ function ProjectForm({ initial, onCancel, onSave }) {
   );
 }
 
-function BarraSimple({ data, valueKey, labelKey, color, formatValue }) {
-  const max = Math.max(1, ...data.map((d) => d[valueKey]));
+/* ---------- Formulario de Curso ---------- */
+function CursoForm({ initial, onCancel, onSave }) {
+  const [c, setC] = useState(initial);
+  useEffect(() => setC(initial), [initial]);
+  const set = (k, v) => setC((prev) => ({ ...prev, [k]: v }));
+  const sugerirComision = () => {
+    const pct = COMISION_SUGERIDA[c.metodoPago] ?? 0;
+    const precio = Number(c.precioFinal || c.precioCotizado || 0);
+    set("comisionMonto", ((precio * pct) / 100).toFixed(2));
+  };
+  const neto = netoItem(c);
+
   return (
-    <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-      {data.map((d, i) => (
-        <div key={i}>
-          <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12, marginBottom: 3 }}>
-            <span style={{ fontWeight: 700 }}>{d[labelKey]}</span>
-            <span style={{ color: COLORS.inkSoft }}>{formatValue ? formatValue(d[valueKey]) : d[valueKey]}</span>
-          </div>
-          <div style={{ background: "#F1EBE2", borderRadius: 6, height: 10, overflow: "hidden" }}>
-            <div style={{ width: `${(d[valueKey] / max) * 100}%`, background: color, height: "100%", borderRadius: 6, transition: "width .3s" }} />
-          </div>
+    <Card>
+      <div style={{ fontSize: 13, fontWeight: 800, color: COLORS.brand, textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 10 }}>Información general</div>
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(140px,1fr))", gap: 10, marginBottom: 18 }}>
+        <Field label="Fecha"><input type="date" style={inputStyle} value={c.fecha} onChange={(e) => set("fecha", e.target.value)} /></Field>
+        <Field label="Nombre del curso"><input style={inputStyle} value={c.curso} onChange={(e) => set("curso", e.target.value)} placeholder="Ej. Curso de Canva" /></Field>
+        <Field label="Persona u organización"><input style={inputStyle} value={c.cliente} onChange={(e) => set("cliente", e.target.value)} placeholder="Nombre y apellido" /></Field>
+        <Field label="Correo"><input type="email" style={inputStyle} value={c.correo} onChange={(e) => set("correo", e.target.value)} placeholder="correo@ejemplo.com" /></Field>
+        <Field label="País"><input style={inputStyle} value={c.pais} onChange={(e) => set("pais", e.target.value)} placeholder="Costa Rica" /></Field>
+        <Field label="Origen">
+          <select style={inputStyle} value={c.origen} onChange={(e) => set("origen", e.target.value)}>
+            <option value="">Sin especificar</option>
+            {ORIGENES.map((o) => <option key={o}>{o}</option>)}
+          </select>
+        </Field>
+        <Field label="Estado">
+          <select style={inputStyle} value={c.estado} onChange={(e) => set("estado", e.target.value)}>{ESTADOS_CURSO.map((s) => <option key={s}>{s}</option>)}</select>
+        </Field>
+        <Field label="Cupo del curso (opcional)">
+          <input type="number" style={inputStyle} value={c.cupoTotal} onChange={(e) => set("cupoTotal", e.target.value)} placeholder="Ej. 20" />
+        </Field>
+      </div>
+      <div style={{ fontSize: 13, fontWeight: 800, color: COLORS.teal, textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 10 }}>Información financiera</div>
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(140px,1fr))", gap: 10, marginBottom: 10 }}>
+        <Field label="Precio cotizado"><input type="number" style={inputStyle} value={c.precioCotizado} onChange={(e) => set("precioCotizado", e.target.value)} /></Field>
+        <Field label="Precio final"><input type="number" style={inputStyle} value={c.precioFinal} onChange={(e) => set("precioFinal", e.target.value)} /></Field>
+        <Field label="Moneda"><select style={inputStyle} value={c.moneda} onChange={(e) => set("moneda", e.target.value)}>{MONEDAS.map((m) => <option key={m}>{m}</option>)}</select></Field>
+        <Field label="Método de pago"><select style={inputStyle} value={c.metodoPago} onChange={(e) => set("metodoPago", e.target.value)}>{METODOS.map((m) => <option key={m}>{m}</option>)}</select></Field>
+        <Field label="Fecha de pago"><input type="date" style={inputStyle} value={c.fechaPago} onChange={(e) => set("fechaPago", e.target.value)} /></Field>
+        <Field label="¿Pago completo?">
+          <select style={inputStyle} value={c.pagoCompleto ? "si" : "no"} onChange={(e) => set("pagoCompleto", e.target.value === "si")}>
+            <option value="si">Completo</option><option value="no">Parcial</option>
+          </select>
+        </Field>
+      </div>
+      <div style={{ display: "flex", gap: 10, alignItems: "flex-end", marginBottom: 8, flexWrap: "wrap" }}>
+        <Field label={`Comisión (sugerido ${COMISION_SUGERIDA[c.metodoPago] ?? 0}%)`}>
+          <input type="number" style={{ ...inputStyle, width: 140 }} value={c.comisionMonto} onChange={(e) => set("comisionMonto", e.target.value)} />
+        </Field>
+        <button onClick={sugerirComision} style={{ border: `1px solid ${COLORS.line}`, background: "#fff", borderRadius: 8, padding: "8px 12px", fontSize: 12, fontWeight: 700, color: COLORS.inkSoft, cursor: "pointer", height: 36 }}>Calcular sugerida</button>
+        <div style={{ marginLeft: "auto", textAlign: "right" }}>
+          <div style={{ fontSize: 11, color: COLORS.inkSoft, fontWeight: 700 }}>NETO ESTIMADO</div>
+          <div style={{ fontFamily: "Georgia, serif", fontWeight: 700, fontSize: 20, color: COLORS.teal }}>{fmtMoney(neto, c.moneda)}</div>
         </div>
-      ))}
-    </div>
+      </div>
+      <div style={{ display: "flex", gap: 10, marginTop: 20, justifyContent: "flex-end" }}>
+        <button onClick={onCancel} style={{ border: `1px solid ${COLORS.line}`, background: "#fff", borderRadius: 8, padding: "10px 16px", fontSize: 13, fontWeight: 700, color: COLORS.inkSoft, cursor: "pointer" }}>Cancelar</button>
+        <button disabled={!c.cliente || !c.curso} onClick={() => onSave(c)} style={{ border: "none", background: c.cliente && c.curso ? COLORS.brand : "#ccc", color: "#fff", borderRadius: 8, padding: "10px 20px", fontSize: 13, fontWeight: 800, cursor: c.cliente && c.curso ? "pointer" : "not-allowed" }}>✓ Guardar curso</button>
+      </div>
+    </Card>
   );
 }
 
-function Dashboard({ projects }) {
+/* ---------- Dashboard ---------- */
+function Dashboard({ proyectos, cursos }) {
   const stats = useMemo(() => {
-    const cobrados = projects.filter((p) => p.precioFinal && p.fechaPago);
-    const totalFacturado = projects.reduce((s, p) => s + Number(p.precioFinal || p.precioCotizado || 0), 0);
-    const totalCobrado = cobrados.reduce((s, p) => s + netoProyecto(p), 0);
-    const totalComisiones = projects.reduce((s, p) => s + Number(p.comisionMonto || 0), 0);
-    const pendiente = projects.filter((p) => p.estado !== "Cancelado" && !p.fechaPago).reduce((s, p) => s + Number(p.precioFinal || p.precioCotizado || 0), 0);
-    const ticketProm = cobrados.length ? totalCobrado / cobrados.length : 0;
-    const proyectosConTiempo = projects.filter((p) => totalMinutos(p) > 0);
-    const vhProm = proyectosConTiempo.length ? proyectosConTiempo.reduce((s, p) => s + valorHora(p), 0) / proyectosConTiempo.length : 0;
+    const todos = [...proyectos, ...cursos];
+    let montoCotizado = 0, montoConfirmado = 0, montoPagadoNeto = 0;
+    proyectos.forEach((p) => {
+      const b = bucketProyecto(p);
+      if (b === "cotizado") montoCotizado += montoBrutoItem(p);
+      if (b === "confirmado") montoConfirmado += montoBrutoItem(p);
+      if (b === "pagado") montoPagadoNeto += netoItem(p);
+    });
+    cursos.forEach((c) => {
+      const b = bucketCurso(c);
+      if (b === "cotizado") montoCotizado += montoBrutoItem(c);
+      if (b === "confirmado") montoConfirmado += montoBrutoItem(c);
+      if (b === "pagado") montoPagadoNeto += netoItem(c);
+    });
+
+    const totalFacturado = todos.reduce((s, p) => s + montoBrutoItem(p), 0);
+    const totalComisiones = todos.reduce((s, p) => s + Number(p.comisionMonto || 0), 0);
     const pctComision = totalFacturado ? (totalComisiones / totalFacturado) * 100 : 0;
-    const cotizados = projects.length;
-    const aprobadosOMas = projects.filter((p) => p.estado !== "Cotizado" && p.estado !== "Cancelado").length;
-    const conversion = cotizados ? (aprobadosOMas / cotizados) * 100 : 0;
+
+    const proyectosConTiempo = proyectos.filter((p) => totalMinutos(p) > 0);
+    const vhProm = proyectosConTiempo.length ? proyectosConTiempo.reduce((s, p) => s + valorHora(p), 0) / proyectosConTiempo.length : 0;
+
     const porMes = {};
-    projects.forEach((p) => { const mes = (p.fechaPago || p.fecha || "").slice(0, 7); if (!mes) return; porMes[mes] = (porMes[mes] || 0) + netoProyecto(p); });
+    todos.forEach((p) => { const mes = (p.fechaPago || p.fecha || "").slice(0, 7); if (!mes) return; porMes[mes] = (porMes[mes] || 0) + netoItem(p); });
     const ventasMes = Object.entries(porMes).sort().map(([mes, total]) => ({ mes, total: Math.round(total) }));
+
     const tiempoPorEtapa = {};
-    projects.forEach((p) => (p.tiempos || []).forEach((t) => { tiempoPorEtapa[t.etapa] = (tiempoPorEtapa[t.etapa] || 0) + Number(t.minutos || 0); }));
+    proyectos.forEach((p) => (p.tiempos || []).forEach((t) => { tiempoPorEtapa[t.etapa] = (tiempoPorEtapa[t.etapa] || 0) + Number(t.minutos || 0); }));
     const tiempoData = Object.entries(tiempoPorEtapa).map(([etapa, minutos]) => ({ etapa, horas: +(minutos / 60).toFixed(1) }));
-    return { totalFacturado, totalCobrado, pendiente, ticketProm, vhProm, pctComision, conversion, ventasMes, tiempoData };
-  }, [projects]);
-  if (projects.length === 0) {
+
+    const cotizacionesAbiertas = todos
+      .filter((p) => p.estado === "Cotizado")
+      .map((p) => ({ ...p, dias: diasDesde(p.fecha) }))
+      .sort((a, b) => (b.dias || 0) - (a.dias || 0));
+
+    return { montoCotizado, montoConfirmado, montoPagadoNeto, totalFacturado, pctComision, vhProm, ventasMes, tiempoData, cotizacionesAbiertas };
+  }, [proyectos, cursos]);
+
+  if (proyectos.length === 0 && cursos.length === 0) {
     return <Card style={{ textAlign: "center", padding: 40 }}>
-      <div style={{ fontFamily: "Georgia, serif", fontSize: 20, fontWeight: 700, marginBottom: 6 }}>Todavía no hay proyectos</div>
-      <div style={{ color: COLORS.inkSoft, fontSize: 14 }}>Agrega tu primer proyecto en la pestaña "Nuevo" para empezar a ver tus números.</div>
+      <div style={{ fontFamily: "Georgia, serif", fontSize: 20, fontWeight: 700, marginBottom: 6 }}>Todavía no hay nada registrado</div>
+      <div style={{ color: COLORS.inkSoft, fontSize: 14 }}>Agrega tu primer proyecto o curso en la pestaña "Nuevo" para empezar a ver tus números.</div>
     </Card>;
   }
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+      <div>
+        <div style={{ fontSize: 12, fontWeight: 800, color: COLORS.inkSoft, textTransform: "uppercase", letterSpacing: 0.6, marginBottom: 8 }}>Flujo de dinero</div>
+        <div style={{ display: "flex", gap: 12, flexWrap: "wrap" }}>
+          <KPI label="Cotizado (sin cerrar)" value={fmtMoney(stats.montoCotizado)} accent={COLORS.amber} sub="propuestas aún no aprobadas" />
+          <KPI label="Confirmado, por cobrar" value={fmtMoney(stats.montoConfirmado)} accent={"#C86A2A"} sub="cerrado pero sin pago" />
+          <KPI label="Pagado" value={fmtMoney(stats.montoPagadoNeto)} accent={COLORS.teal} sub="neto, ya recibido" />
+        </div>
+      </div>
+
       <div style={{ display: "flex", gap: 12, flexWrap: "wrap" }}>
         <KPI label="Facturado total" value={fmtMoney(stats.totalFacturado)} />
-        <KPI label="Cobrado (neto)" value={fmtMoney(stats.totalCobrado)} accent={COLORS.teal} />
-        <KPI label="Pendiente de cobro" value={fmtMoney(stats.pendiente)} accent={COLORS.amber} />
-        <KPI label="Ticket promedio" value={fmtMoney(stats.ticketProm)} />
-        <KPI label="Valor por hora prom." value={fmtMoney(stats.vhProm)} accent={COLORS.brand} sub="entre proyectos con tiempo registrado" />
+        <KPI label="Valor por hora prom." value={fmtMoney(stats.vhProm)} accent={COLORS.brand} sub="proyectos con tiempo registrado" />
         <KPI label="Comisiones" value={stats.pctComision.toFixed(1) + "%"} sub="del total facturado" />
-        <KPI label="Conversión" value={stats.conversion.toFixed(0) + "%"} sub="cotizado → aprobado o más" />
       </div>
+
+      {stats.cotizacionesAbiertas.length > 0 && (
+        <Card>
+          <div style={{ fontWeight: 800, fontSize: 14, marginBottom: 10 }}>Cotizaciones esperando respuesta</div>
+          <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+            {stats.cotizacionesAbiertas.slice(0, 8).map((p) => (
+              <div key={p.id} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", fontSize: 13, padding: "6px 0", borderBottom: `1px dashed ${COLORS.line}` }}>
+                <span><strong>{p.cliente}</strong> <span style={{ color: COLORS.inkSoft }}>· {p.servicio || p.curso}</span></span>
+                <span style={{
+                  fontWeight: 700, fontSize: 12,
+                  color: p.dias >= DIAS_ALERTA_COTIZACION ? COLORS.red : COLORS.inkSoft,
+                }}>
+                  {p.dias === 0 ? "hoy" : `hace ${p.dias} día${p.dias === 1 ? "" : "s"}`}
+                </span>
+              </div>
+            ))}
+          </div>
+        </Card>
+      )}
+
       <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16, minWidth: 0 }}>
         <Card>
           <div style={{ fontWeight: 800, fontSize: 14, marginBottom: 14 }}>Cobrado por mes</div>
@@ -262,7 +413,7 @@ function Dashboard({ projects }) {
             : <BarraSimple data={stats.ventasMes} valueKey="total" labelKey="mes" color={COLORS.teal} formatValue={(v) => fmtMoney(v)} />}
         </Card>
         <Card>
-          <div style={{ fontWeight: 800, fontSize: 14, marginBottom: 14 }}>Distribución del tiempo</div>
+          <div style={{ fontWeight: 800, fontSize: 14, marginBottom: 14 }}>Distribución del tiempo (proyectos)</div>
           {stats.tiempoData.length === 0
             ? <div style={{ color: COLORS.inkSoft, fontSize: 13 }}>Aún no hay tiempo registrado.</div>
             : <BarraSimple data={stats.tiempoData} valueKey="horas" labelKey="etapa" color={COLORS.brand} formatValue={(v) => v + " h"} />}
@@ -272,18 +423,23 @@ function Dashboard({ projects }) {
   );
 }
 
+/* ---------- Listas: Proyectos y Cursos ---------- */
 function ProjectRow({ p, onUpdate, onDelete }) {
   const [open, setOpen] = useState(false);
   const [editing, setEditing] = useState(false);
+  const dias = p.estado === "Cotizado" ? diasDesde(p.fecha) : null;
   return (
     <div style={{ borderBottom: `1px dashed ${COLORS.line}` }}>
       <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "12px 4px", cursor: "pointer" }} onClick={() => setOpen(!open)}>
         <span>{open ? "▾" : "▸"}</span>
         <div style={{ flex: 1, minWidth: 0 }}>
           <div style={{ fontWeight: 700, fontSize: 14 }}>{p.cliente} <span style={{ color: COLORS.inkSoft, fontWeight: 400 }}>· {p.servicio}</span></div>
-          <div style={{ fontSize: 12, color: COLORS.inkSoft }}>{p.fecha} {p.pais && `· ${p.pais}`}</div>
+          <div style={{ fontSize: 12, color: COLORS.inkSoft }}>
+            {p.fecha} {p.pais && `· ${p.pais}`} {p.origen && `· ${p.origen}`}
+            {dias !== null && dias >= DIAS_ALERTA_COTIZACION && <span style={{ color: COLORS.red, fontWeight: 700 }}> · esperando hace {dias} días</span>}
+          </div>
         </div>
-        <div style={{ textAlign: "right", fontSize: 13, fontWeight: 700, color: COLORS.teal }}>{fmtMoney(netoProyecto(p), p.moneda)}</div>
+        <div style={{ textAlign: "right", fontSize: 13, fontWeight: 700, color: COLORS.teal }}>{fmtMoney(netoItem(p), p.moneda)}</div>
         <EstadoBadge estado={p.estado} />
       </div>
       {open && !editing && (
@@ -302,26 +458,93 @@ function ProjectRow({ p, onUpdate, onDelete }) {
     </div>
   );
 }
-function ProyectosView({ projects, onUpdate, onDelete }) {
+function ProyectosView({ proyectos, onUpdate, onDelete }) {
   const [filtro, setFiltro] = useState("");
-  const filtrados = projects.filter((p) => (p.cliente + p.servicio + p.pais).toLowerCase().includes(filtro.toLowerCase())).sort((a, b) => (b.fecha || "").localeCompare(a.fecha || ""));
+  const [origenFiltro, setOrigenFiltro] = useState("");
+  const filtrados = proyectos
+    .filter((p) => (p.cliente + p.servicio + p.pais).toLowerCase().includes(filtro.toLowerCase()))
+    .filter((p) => !origenFiltro || p.origen === origenFiltro)
+    .sort((a, b) => (b.fecha || "").localeCompare(a.fecha || ""));
   return (
     <Card>
-      <input placeholder="Buscar cliente, servicio o país..." value={filtro} onChange={(e) => setFiltro(e.target.value)} style={{ ...inputStyle, width: "100%", marginBottom: 12, boxSizing: "border-box" }} />
+      <div style={{ display: "flex", gap: 10, marginBottom: 12, flexWrap: "wrap" }}>
+        <input placeholder="Buscar cliente, servicio o país..." value={filtro} onChange={(e) => setFiltro(e.target.value)} style={{ ...inputStyle, flex: 1, minWidth: 200 }} />
+        <select style={{ ...inputStyle, minWidth: 160 }} value={origenFiltro} onChange={(e) => setOrigenFiltro(e.target.value)}>
+          <option value="">Todos los orígenes</option>
+          {ORIGENES.map((o) => <option key={o}>{o}</option>)}
+        </select>
+      </div>
       {filtrados.length === 0 && <div style={{ color: COLORS.inkSoft, fontSize: 14, padding: 16 }}>Sin resultados.</div>}
       {filtrados.map((p) => <ProjectRow key={p.id} p={p} onUpdate={onUpdate} onDelete={onDelete} />)}
     </Card>
   );
 }
 
-function agrupar(projects, keyFn) {
+function CursoRow({ c, onUpdate, onDelete }) {
+  const [open, setOpen] = useState(false);
+  const [editing, setEditing] = useState(false);
+  const dias = c.estado === "Cotizado" ? diasDesde(c.fecha) : null;
+  return (
+    <div style={{ borderBottom: `1px dashed ${COLORS.line}` }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "12px 4px", cursor: "pointer" }} onClick={() => setOpen(!open)}>
+        <span>{open ? "▾" : "▸"}</span>
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div style={{ fontWeight: 700, fontSize: 14 }}>{c.cliente} <span style={{ color: COLORS.inkSoft, fontWeight: 400 }}>· {c.curso}</span></div>
+          <div style={{ fontSize: 12, color: COLORS.inkSoft }}>
+            {c.fecha} {c.pais && `· ${c.pais}`} {c.origen && `· ${c.origen}`}
+            {dias !== null && dias >= DIAS_ALERTA_COTIZACION && <span style={{ color: COLORS.red, fontWeight: 700 }}> · esperando hace {dias} días</span>}
+          </div>
+        </div>
+        <div style={{ textAlign: "right", fontSize: 13, fontWeight: 700, color: COLORS.teal }}>{fmtMoney(netoItem(c), c.moneda)}</div>
+        <EstadoBadge estado={c.estado} />
+      </div>
+      {open && !editing && (
+        <div style={{ padding: "0 4px 16px 30px", fontSize: 13, color: COLORS.inkSoft, display: "flex", flexDirection: "column", gap: 4 }}>
+          <div>Correo: {c.correo || "—"}</div>
+          <div>Precio cotizado: {fmtMoney(c.precioCotizado, c.moneda)} · Precio final: {fmtMoney(c.precioFinal, c.moneda)}</div>
+          <div>Método de pago: {c.metodoPago} · Comisión: {fmtMoney(c.comisionMonto, c.moneda)} · Pago: {c.pagoCompleto ? "Completo" : "Parcial"} {c.fechaPago && `(${c.fechaPago})`}</div>
+          {c.cupoTotal && <div>Cupo del curso: {c.cupoTotal}</div>}
+          <div style={{ display: "flex", gap: 10, marginTop: 8 }}>
+            <button onClick={() => setEditing(true)} style={{ border: `1px solid ${COLORS.line}`, background: "#fff", borderRadius: 8, padding: "6px 12px", fontSize: 12, fontWeight: 700, cursor: "pointer" }}>Editar</button>
+            <button onClick={() => onDelete(c.id)} style={{ border: "none", background: "none", color: COLORS.red, fontSize: 12, fontWeight: 700, cursor: "pointer" }}>Eliminar</button>
+          </div>
+        </div>
+      )}
+      {open && editing && <div style={{ padding: "0 0 16px 0" }}><CursoForm initial={c} onCancel={() => setEditing(false)} onSave={(nc) => { onUpdate(nc); setEditing(false); }} /></div>}
+    </div>
+  );
+}
+function CursosView({ cursos, onUpdate, onDelete }) {
+  const [filtro, setFiltro] = useState("");
+  const [origenFiltro, setOrigenFiltro] = useState("");
+  const filtrados = cursos
+    .filter((c) => (c.cliente + c.curso + c.pais).toLowerCase().includes(filtro.toLowerCase()))
+    .filter((c) => !origenFiltro || c.origen === origenFiltro)
+    .sort((a, b) => (b.fecha || "").localeCompare(a.fecha || ""));
+  return (
+    <Card>
+      <div style={{ display: "flex", gap: 10, marginBottom: 12, flexWrap: "wrap" }}>
+        <input placeholder="Buscar persona, curso o país..." value={filtro} onChange={(e) => setFiltro(e.target.value)} style={{ ...inputStyle, flex: 1, minWidth: 200 }} />
+        <select style={{ ...inputStyle, minWidth: 160 }} value={origenFiltro} onChange={(e) => setOrigenFiltro(e.target.value)}>
+          <option value="">Todos los orígenes</option>
+          {ORIGENES.map((o) => <option key={o}>{o}</option>)}
+        </select>
+      </div>
+      {filtrados.length === 0 && <div style={{ color: COLORS.inkSoft, fontSize: 14, padding: 16 }}>Sin resultados.</div>}
+      {filtrados.map((c) => <CursoRow key={c.id} c={c} onUpdate={onUpdate} onDelete={onDelete} />)}
+    </Card>
+  );
+}
+
+/* ---------- Reportes ---------- */
+function agrupar(items, keyFn) {
   const map = {};
-  projects.forEach((p) => {
+  items.forEach((p) => {
     const k = keyFn(p) || "—";
     if (!map[k]) map[k] = { count: 0, neto: 0, minutos: 0 };
-    map[k].count += 1; map[k].neto += netoProyecto(p); map[k].minutos += totalMinutos(p);
+    map[k].count += 1; map[k].neto += netoItem(p); map[k].minutos += totalMinutos(p);
   });
-  return Object.entries(map).map(([k, v]) => ({ nombre: k, proyectos: v.count, neto: v.neto, horas: +(v.minutos / 60).toFixed(1), valorHora: v.minutos ? v.neto / (v.minutos / 60) : null }));
+  return Object.entries(map).map(([k, v]) => ({ nombre: k, cantidad: v.count, neto: v.neto, horas: +(v.minutos / 60).toFixed(1), valorHora: v.minutos ? v.neto / (v.minutos / 60) : null }));
 }
 function TablaReporte({ titulo, filas, columnas }) {
   return (
@@ -336,43 +559,89 @@ function TablaReporte({ titulo, filas, columnas }) {
     </Card>
   );
 }
-function ReportesView({ projects }) {
-  const porServicio = useMemo(() => agrupar(projects, (p) => p.servicio).sort((a, b) => b.neto - a.neto), [projects]);
-  const porCliente = useMemo(() => agrupar(projects, (p) => p.cliente).sort((a, b) => b.neto - a.neto), [projects]);
-  const porPais = useMemo(() => agrupar(projects, (p) => p.pais), [projects]);
+function ReportesView({ proyectos, cursos }) {
+  const todos = useMemo(() => [...proyectos, ...cursos], [proyectos, cursos]);
+  const porServicio = useMemo(() => agrupar(proyectos, (p) => p.servicio).sort((a, b) => b.neto - a.neto), [proyectos]);
+  const porCliente = useMemo(() => agrupar(proyectos, (p) => p.cliente).sort((a, b) => b.neto - a.neto), [proyectos]);
+  const porPais = useMemo(() => agrupar(todos, (p) => p.pais), [todos]);
+  const porCurso = useMemo(() => {
+    const map = {};
+    cursos.forEach((c) => {
+      const k = c.curso || "—";
+      if (!map[k]) map[k] = { count: 0, neto: 0, cupo: 0 };
+      map[k].count += 1; map[k].neto += netoItem(c);
+      if (Number(c.cupoTotal) > map[k].cupo) map[k].cupo = Number(c.cupoTotal);
+    });
+    return Object.entries(map).map(([nombre, v]) => ({ nombre, cantidad: v.count, neto: v.neto, cupo: v.cupo || null })).sort((a, b) => b.neto - a.neto);
+  }, [cursos]);
   const porMetodo = useMemo(() => {
     const map = {};
-    projects.forEach((p) => { const k = p.metodoPago || "—"; if (!map[k]) map[k] = { monto: 0, comision: 0 }; map[k].monto += Number(p.precioFinal || p.precioCotizado || 0); map[k].comision += Number(p.comisionMonto || 0); });
+    todos.forEach((p) => { const k = p.metodoPago || "—"; if (!map[k]) map[k] = { monto: 0, comision: 0 }; map[k].monto += montoBrutoItem(p); map[k].comision += Number(p.comisionMonto || 0); });
     return Object.entries(map).map(([nombre, v]) => ({ nombre, monto: v.monto, comision: v.comision }));
-  }, [projects]);
-  const colServicio = [{ key: "nombre", label: "Servicio" }, { key: "proyectos", label: "Proyectos" }, { key: "neto", label: "Ingreso neto", render: (v) => fmtMoney(v) }, { key: "horas", label: "Horas" }, { key: "valorHora", label: "$/hora", render: (v) => v === null ? "—" : fmtMoney(v) }];
-  const colCliente = [{ key: "nombre", label: "Cliente" }, { key: "proyectos", label: "Proyectos" }, { key: "neto", label: "Total neto", render: (v) => fmtMoney(v) }];
-  const colPais = [{ key: "nombre", label: "País" }, { key: "proyectos", label: "Proyectos" }, { key: "neto", label: "Neto", render: (v) => fmtMoney(v) }];
+  }, [todos]);
+  const porOrigen = useMemo(() => {
+    const map = {};
+    todos.forEach((p) => {
+      const k = p.origen || "Sin especificar";
+      if (!map[k]) map[k] = { total: 0, cerrados: 0, neto: 0 };
+      map[k].total += 1;
+      const cerrado = p.estado !== "Cotizado" && p.estado !== "Cancelado";
+      if (cerrado) { map[k].cerrados += 1; map[k].neto += netoItem(p); }
+    });
+    return Object.entries(map).map(([nombre, v]) => ({ nombre, total: v.total, cerrados: v.cerrados, neto: v.neto, conversion: v.total ? (v.cerrados / v.total) * 100 : 0 })).sort((a, b) => b.neto - a.neto);
+  }, [todos]);
+
+  const colServicio = [{ key: "nombre", label: "Servicio" }, { key: "cantidad", label: "Proyectos" }, { key: "neto", label: "Ingreso neto", render: (v) => fmtMoney(v) }, { key: "horas", label: "Horas" }, { key: "valorHora", label: "$/hora", render: (v) => v === null ? "—" : fmtMoney(v) }];
+  const colCliente = [{ key: "nombre", label: "Cliente" }, { key: "cantidad", label: "Proyectos" }, { key: "neto", label: "Total neto", render: (v) => fmtMoney(v) }];
+  const colPais = [{ key: "nombre", label: "País" }, { key: "cantidad", label: "Cantidad" }, { key: "neto", label: "Neto", render: (v) => fmtMoney(v) }];
+  const colCurso = [{ key: "nombre", label: "Curso" }, { key: "cantidad", label: "Ventas" }, { key: "cupo", label: "Cupo", render: (v, f) => v ? `${f.cantidad}/${v}` : "—" }, { key: "neto", label: "Ingreso neto", render: (v) => fmtMoney(v) }];
   const colMetodo = [{ key: "nombre", label: "Método" }, { key: "monto", label: "Monto bruto", render: (v) => fmtMoney(v) }, { key: "comision", label: "Comisión pagada", render: (v) => fmtMoney(v) }];
+  const colOrigen = [
+    { key: "nombre", label: "Origen" }, { key: "total", label: "Total" }, { key: "cerrados", label: "Cerrados" },
+    { key: "conversion", label: "Conversión", render: (v) => v.toFixed(0) + "%" },
+    { key: "neto", label: "Ingreso neto", render: (v) => fmtMoney(v) },
+  ];
+
   return (
     <div>
+      <TablaReporte titulo="De dónde vienen los clientes (proyectos + cursos)" filas={porOrigen} columnas={colOrigen} />
       <TablaReporte titulo="Servicios — ordenado por rentabilidad" filas={porServicio} columnas={colServicio} />
       <TablaReporte titulo="Clientes más rentables" filas={porCliente} columnas={colCliente} />
+      <TablaReporte titulo="Cursos más vendidos" filas={porCurso} columnas={colCurso} />
       <TablaReporte titulo="Países" filas={porPais} columnas={colPais} />
       <TablaReporte titulo="Métodos de pago" filas={porMetodo} columnas={colMetodo} />
     </div>
   );
 }
 
+/* ---------- App principal ---------- */
 function App() {
-  const [projects, setProjects] = useState([]);
+  const [proyectos, setProyectos] = useState([]);
+  const [cursos, setCursos] = useState([]);
   const [loading, setLoading] = useState(true);
   const [tab, setTab] = useState("dashboard");
+  const [tipoNuevo, setTipoNuevo] = useState(null); // "proyecto" | "curso" | null
 
-  useEffect(() => { loadProjects().then((list) => { setProjects(list); setLoading(false); }); }, []);
-  const persist = async (list) => { setProjects(list); await saveProjects(list); };
-  const guardarNuevo = async (p) => { await persist([...projects, p]); setTab("proyectos"); };
-  const actualizar = async (p) => { await persist(projects.map((x) => (x.id === p.id ? p : x))); };
-  const eliminar = async (id) => { await persist(projects.filter((x) => x.id !== id)); };
+  useEffect(() => {
+    loadData().then(({ proyectos, cursos }) => { setProyectos(proyectos); setCursos(cursos); setLoading(false); });
+  }, []);
+
+  const persist = async (nuevosProyectos, nuevosCursos) => {
+    setProyectos(nuevosProyectos);
+    setCursos(nuevosCursos);
+    await saveData({ proyectos: nuevosProyectos, cursos: nuevosCursos });
+  };
+
+  const guardarNuevoProyecto = async (p) => { await persist([...proyectos, p], cursos); setTipoNuevo(null); setTab("proyectos"); };
+  const guardarNuevoCurso = async (c) => { await persist(proyectos, [...cursos, c]); setTipoNuevo(null); setTab("cursos"); };
+  const actualizarProyecto = async (p) => { await persist(proyectos.map((x) => (x.id === p.id ? p : x)), cursos); };
+  const actualizarCurso = async (c) => { await persist(proyectos, cursos.map((x) => (x.id === c.id ? c : x))); };
+  const eliminarProyecto = async (id) => { await persist(proyectos.filter((x) => x.id !== id), cursos); };
+  const eliminarCurso = async (id) => { await persist(proyectos, cursos.filter((x) => x.id !== id)); };
 
   const tabs = [
     { id: "dashboard", label: "Panel" }, { id: "nuevo", label: "Nuevo" },
-    { id: "proyectos", label: "Proyectos" }, { id: "reportes", label: "Reportes" },
+    { id: "proyectos", label: "Proyectos" }, { id: "cursos", label: "Cursos" }, { id: "reportes", label: "Reportes" },
   ];
 
   return (
@@ -383,10 +652,10 @@ function App() {
             <div style={{ fontFamily: "Georgia, serif", fontWeight: 800, fontSize: 26, letterSpacing: -0.5 }}>YES WAY</div>
             <div style={{ fontSize: 12, color: "#ffffffaa", fontWeight: 600, textTransform: "uppercase", letterSpacing: 1 }}>Panel de rentabilidad</div>
           </div>
-          <nav style={{ display: "flex", gap: 4, marginTop: 16 }}>
+          <nav style={{ display: "flex", gap: 4, marginTop: 16, flexWrap: "wrap" }}>
             {tabs.map((t) => {
               const active = tab === t.id;
-              return <button key={t.id} onClick={() => setTab(t.id)} style={{ background: active ? COLORS.bg : "transparent", color: active ? COLORS.ink : "#ffffffcc", border: "none", borderRadius: "10px 10px 0 0", padding: "9px 16px", fontSize: 13, fontWeight: 700, cursor: "pointer" }}>{t.label}</button>;
+              return <button key={t.id} onClick={() => { setTab(t.id); if (t.id === "nuevo") setTipoNuevo(null); }} style={{ background: active ? COLORS.bg : "transparent", color: active ? COLORS.ink : "#ffffffcc", border: "none", borderRadius: "10px 10px 0 0", padding: "9px 16px", fontSize: 13, fontWeight: 700, cursor: "pointer" }}>{t.label}</button>;
             })}
           </nav>
         </div>
@@ -394,10 +663,27 @@ function App() {
       <main style={{ maxWidth: 900, margin: "0 auto", padding: "24px 20px 60px" }}>
         {loading ? <div style={{ textAlign: "center", padding: 60, color: COLORS.inkSoft }}>Cargando...</div> : (
           <>
-            {tab === "dashboard" && <Dashboard projects={projects} />}
-            {tab === "nuevo" && <ProjectForm initial={emptyProject()} onCancel={() => setTab("dashboard")} onSave={guardarNuevo} />}
-            {tab === "proyectos" && <ProyectosView projects={projects} onUpdate={actualizar} onDelete={eliminar} />}
-            {tab === "reportes" && <ReportesView projects={projects} />}
+            {tab === "dashboard" && <Dashboard proyectos={proyectos} cursos={cursos} />}
+
+            {tab === "nuevo" && (
+              <div>
+                {!tipoNuevo && (
+                  <Card style={{ textAlign: "center", padding: 30 }}>
+                    <div style={{ fontWeight: 800, fontSize: 15, marginBottom: 16 }}>¿Qué quieres registrar?</div>
+                    <div style={{ display: "flex", gap: 12, justifyContent: "center" }}>
+                      <button onClick={() => setTipoNuevo("proyecto")} style={{ background: COLORS.brand, color: "#fff", border: "none", borderRadius: 10, padding: "14px 26px", fontSize: 14, fontWeight: 800, cursor: "pointer" }}>Proyecto</button>
+                      <button onClick={() => setTipoNuevo("curso")} style={{ background: COLORS.ink, color: "#fff", border: "none", borderRadius: 10, padding: "14px 26px", fontSize: 14, fontWeight: 800, cursor: "pointer" }}>Curso</button>
+                    </div>
+                  </Card>
+                )}
+                {tipoNuevo === "proyecto" && <ProjectForm initial={emptyProject()} onCancel={() => setTipoNuevo(null)} onSave={guardarNuevoProyecto} />}
+                {tipoNuevo === "curso" && <CursoForm initial={emptyCurso()} onCancel={() => setTipoNuevo(null)} onSave={guardarNuevoCurso} />}
+              </div>
+            )}
+
+            {tab === "proyectos" && <ProyectosView proyectos={proyectos} onUpdate={actualizarProyecto} onDelete={eliminarProyecto} />}
+            {tab === "cursos" && <CursosView cursos={cursos} onUpdate={actualizarCurso} onDelete={eliminarCurso} />}
+            {tab === "reportes" && <ReportesView proyectos={proyectos} cursos={cursos} />}
           </>
         )}
       </main>
